@@ -31,7 +31,9 @@ services:
       - "8000:8000"
     volumes:
       - ./app:/code/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - chroma_data:/code/chroma_data
+    command: gunicorn --bind 0.0.0.0:8000 --timeout 120 --reload app.main:app
 
 volumes:
   pgdata:
+  chroma_data:
