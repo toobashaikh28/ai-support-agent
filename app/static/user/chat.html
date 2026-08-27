@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Support Chat</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="chat-page">
+    <div class="topbar">
+      <h1>Support Chat</h1>
+      <div>
+        <span class="user-info" id="user-info"></span>
+        <span class="logout-link" id="logout-link">Log out</span>
+      </div>
+    </div>
+
+    <div class="messages-area" id="messages-area">
+      <div class="empty-chat" id="empty-chat">Ask a question to get started.</div>
+    </div>
+
+    <div class="composer">
+      <form class="composer-inner" id="composer-form">
+        <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" required>
+        <button type="submit" id="send-btn">Send</button>
+      </form>
+    </div>
+  </div>
+
+  <script src="chat.js"></script>
+</body>
+</html>

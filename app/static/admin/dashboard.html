@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Document Ingestion — Admin</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="topbar">
+    <h1>Knowledge Base Documents</h1>
+    <div>
+      <span class="user-info" id="user-info"></span>
+      <span class="logout-link" id="logout-link">Log out</span>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="dropzone" id="dropzone">
+      <p class="main-text">Drop a file here or click to browse</p>
+      <p>PDF, Word (.docx), .txt, or .md — up to 20MB</p>
+      <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md" style="display:none">
+    </div>
+    <div class="error-text" id="upload-error"></div>
+
+    <table id="docs-table">
+      <thead>
+        <tr>
+          <th>Filename</th>
+          <th>Type</th>
+          <th>Status</th>
+          <th>Chunks</th>
+          <th>Uploaded</th>
+          <th>Uploaded by</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="docs-body">
+      </tbody>
+    </table>
+    <div class="empty-state" id="empty-state" style="display:none">
+      No documents uploaded yet.
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="modal-title">Chunks</h2>
+        <span class="modal-close" id="modal-close">&times;</span>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>

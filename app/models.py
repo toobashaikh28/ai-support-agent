@@ -119,6 +119,18 @@ class TicketPriority(str, enum.Enum):
     urgent = "urgent"
 
 
+class DocumentStatus(str, enum.Enum):
+    pending = "pending"       # 0 - uploaded, not yet processed
+    processing = "processing"  # actively being chunked/embedded
+    success = "success"       # 1 - fully ingested
+    fail = "fail"              # 2 - failed, can be retried
+
+
+class FeedbackValue(str, enum.Enum):
+    good = "good"
+    bad = "bad"
+
+
 # --------------------------------------------------------------------------
 # Core commerce tables
 # --------------------------------------------------------------------------
@@ -134,6 +146,9 @@ class Customer(Base):
     city: Mapped[str | None] = mapped_column(String(80))
     country: Mapped[str | None] = mapped_column(String(80))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # NULL for Faker-seeded demo customers (Day 1). Set when a customer
+    # registers for the self-service chat dashboard (this feature).
+    hashed_password: Mapped[str | None] = mapped_column(String(255))
 
     orders: Mapped[list["Order"]] = relationship(back_populates="customer", cascade="all, delete-orphan")
     conversations: Mapped[list["Conversation"]] = relationship(back_populates="customer", cascade="all, delete-orphan")
@@ -307,6 +322,13 @@ class Message(Base):
     sender_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    # Only set on sender_type=agent messages: which retrieved chunks backed
+    # this reply. Persisted (not just returned on the POST response) so
+    # citations still show correctly when history is reloaded later.
+    citations: Mapped[list | None] = mapped_column(JSONType)
+    # Only meaningful on sender_type=agent messages. NULL until the user
+    # rates the reply; "good"/"bad" thereafter.
+    feedback: Mapped[FeedbackValue | None] = mapped_column(Enum(FeedbackValue, name="feedback_value"))
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
     sender_user: Mapped["User | None"] = relationship(back_populates="messages")
@@ -360,3 +382,31 @@ class ActionLog(Base):
 
     user: Mapped["User | None"] = relationship(back_populates="action_logs")
     ticket: Mapped["Ticket | None"] = relationship(back_populates="action_logs")
+
+
+class Document(Base):
+    """An admin-uploaded knowledge-base document, tracked through its
+    ingestion pipeline: pending -> processing -> success | fail.
+    A failed row can be retried without re-uploading the file."""
+
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(20), nullable=False)  # pdf | docx | txt | md
+    uploaded_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    status: Mapped[DocumentStatus] = mapped_column(
+        Enum(DocumentStatus, name="document_status"),
+        default=DocumentStatus.pending,
+        nullable=False,
+        index=True,
+    )
+    chunk_count: Mapped[int | None] = mapped_column(Integer)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    uploaded_by: Mapped["User | None"] = relationship()

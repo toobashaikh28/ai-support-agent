@@ -39,9 +39,12 @@ SYSTEM_PROMPT = (
 )
 
 
-def call_llm(history: list[dict[str, str]]) -> str:
+def call_llm(history: list[dict[str, str]], system_prompt: str | None = None) -> str:
     """
     history: list of {"role": "user"|"assistant", "content": str}, oldest first.
+    system_prompt: overrides the default persona - used by the RAG grounding
+    layer (app/rag/chat_grounding.py) to inject retrieved context and strict
+    "answer only from this" instructions per-call.
     Returns the assistant's reply text.
     """
     client = get_client()
@@ -58,6 +61,6 @@ def call_llm(history: list[dict[str, str]]) -> str:
     response = client.models.generate_content(
         model=MODEL,
         contents=contents,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        config=types.GenerateContentConfig(system_instruction=system_prompt or SYSTEM_PROMPT),
     )
     return response.text

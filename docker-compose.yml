@@ -27,13 +27,19 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-apppass}@db:5432/${POSTGRES_DB:-supportdb}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-secret-change-me}
+      UPLOAD_DIR: /code/uploads
     ports:
       - "8000:8000"
     volumes:
       - ./app:/code/app
       - chroma_data:/code/chroma_data
-    command: gunicorn --bind 0.0.0.0:8000 --timeout 120 --reload app.main:app
+      - uploads_data:/code/uploads
+      - fastembed_cache:/code/fastembed_cache
+    command: gunicorn --bind 0.0.0.0:8000 --timeout 120 --workers 3 --reload app.main:app
 
 volumes:
   pgdata:
   chroma_data:
+  uploads_data:
+  fastembed_cache:

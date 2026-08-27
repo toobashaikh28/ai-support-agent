@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Admin Login</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="center-screen">
+    <div class="card login-card">
+      <h1>Admin Login</h1>
+      <p class="subtitle">Sign in to manage knowledge-base documents.</p>
+
+      <form id="login-form">
+        <label for="email">Email</label>
+        <input type="email" id="email" required autocomplete="username" value="admin@example.com">
+
+        <label for="password">Password</label>
+        <input type="password" id="password" required autocomplete="current-password">
+
+        <button type="submit" class="btn-primary" id="submit-btn">Sign in</button>
+        <div class="error-text" id="error-text"></div>
+      </form>
+    </div>
+  </div>
+
+  <script src="login.js"></script>
+</body>
+</html>

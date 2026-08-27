@@ -1,13 +1,22 @@
-from flask import Flask, g, jsonify, request
+import os
+import threading
+import uuid
+
+from flask import Flask, g, jsonify, request, send_from_directory
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
+from app.auth import hash_password, issue_token, require_admin, require_customer, verify_password
 from app.database import Base, SessionLocal, engine
 from app.llm import call_llm
+from app.rag.chat_grounding import generate_grounded_reply
 from app.models import (
     Conversation,
     Customer,
+    Document,
+    DocumentStatus,
+    FeedbackValue,
     Message,
     Order,
     OrderItem,
@@ -15,9 +24,15 @@ from app.models import (
     Product,
     SenderType,
     Ticket,
+    User,
 )
+from app.rag.document_pipeline import process_document
 from app.rag.embeddings import embed_query
-from app.rag.store import get_collection
+from app.rag.extraction import detect_file_type
+from app.rag.store import get_admin_collection, get_collection
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/code/uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
@@ -25,6 +40,20 @@ app = Flask(__name__)
 # time, before the app starts serving requests.
 with app.app_context():
     Base.metadata.create_all(engine)
+
+
+@app.get("/admin")
+def admin_entry():
+    from flask import redirect
+
+    return redirect("/static/admin/login.html")
+
+
+@app.get("/app")
+def user_app_entry():
+    from flask import redirect
+
+    return redirect("/static/user/login.html")
 
 
 # --------------------------------------------------------------------------
@@ -70,6 +99,52 @@ class ChatRequest(BaseModel):
     customer_id: int | None = None
 
 
+def _run_chat_turn(conversation: "Conversation", user_message: str, db) -> tuple["Message", list]:
+    """Stores the user's message, runs grounded generation with recent
+    context, stores the assistant's reply, and returns the assistant's
+    Message row (so callers can return its id, e.g. for feedback) plus
+    citations. Shared by /chat and /chat/me so both stay in sync."""
+    db.add(
+        Message(
+            conversation_id=conversation.id,
+            sender_type=SenderType.customer,
+            body=user_message,
+        )
+    )
+    db.flush()
+
+    recent = db.scalars(
+        select(Message)
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.sent_at.desc(), Message.id.desc())
+        .limit(CONTEXT_WINDOW)
+    ).all()
+    recent = list(reversed(recent))  # oldest first for the LLM
+
+    llm_history = [
+        {
+            "role": "assistant" if m.sender_type == SenderType.agent else "user",
+            "content": m.body,
+        }
+        for m in recent
+    ]
+
+    reply_text, citations = generate_grounded_reply(llm_history, user_message)
+
+    assistant_message = Message(
+        conversation_id=conversation.id,
+        sender_type=SenderType.agent,
+        sender_user_id=None,  # NULL = the bot, not a human agent
+        body=reply_text,
+        citations=citations,
+    )
+    db.add(assistant_message)
+    db.commit()
+    db.refresh(assistant_message)
+
+    return assistant_message, citations
+
+
 @app.post("/chat")
 def chat():
     db = get_db()
@@ -97,47 +172,16 @@ def chat():
         db.add(conversation)
         db.flush()  # assigns conversation.id without committing yet
 
-    # --- store the incoming user message --------------------------------
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            sender_type=SenderType.customer,
-            body=payload.message,
-        )
-    )
-    db.flush()
+    assistant_message, citations = _run_chat_turn(conversation, payload.message, db)
 
-    # --- load recent history for context ---------------------------------
-    recent = db.scalars(
-        select(Message)
-        .where(Message.conversation_id == conversation.id)
-        .order_by(Message.sent_at.desc(), Message.id.desc())
-        .limit(CONTEXT_WINDOW)
-    ).all()
-    recent = list(reversed(recent))  # oldest first for the LLM
-
-    llm_history = [
+    return jsonify(
         {
-            "role": "assistant" if m.sender_type == SenderType.agent else "user",
-            "content": m.body,
+            "session_id": conversation.id,
+            "reply": assistant_message.body,
+            "citations": citations,
+            "message_id": assistant_message.id,
         }
-        for m in recent
-    ]
-
-    reply_text = call_llm(llm_history)
-
-    # --- store the assistant reply ---------------------------------------
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            sender_type=SenderType.agent,
-            sender_user_id=None,  # NULL = the bot, not a human agent
-            body=reply_text,
-        )
     )
-    db.commit()
-
-    return jsonify({"session_id": conversation.id, "reply": reply_text})
 
 
 @app.get("/chat/<int:session_id>/history")
@@ -247,6 +291,379 @@ def customer_orders(customer_id: int):
             ],
         }
     )
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/login")
+def login():
+    db = get_db()
+    try:
+        payload = LoginRequest.model_validate(request.get_json(force=True, silent=True) or {})
+    except ValidationError as e:
+        return api_error(e.errors()[0]["msg"], 422)
+
+    user = db.scalar(select(User).where(User.email == payload.email))
+    if not user or not user.is_active:
+        return api_error("Invalid email or password", 401)
+    if not verify_password(payload.password, user.hashed_password):
+        return api_error("Invalid email or password", 401)
+
+    token = issue_token(user.id, user.email, user.role.value)
+    return jsonify(
+        {
+            "token": token,
+            "user": {"id": user.id, "name": user.full_name, "email": user.email, "role": user.role.value},
+        }
+    )
+
+
+# --------------------------------------------------------------------------
+# Customer-facing auth + chat dashboard (register, login, one chat per user,
+# thumbs up/down feedback on AI replies).
+# --------------------------------------------------------------------------
+
+class RegisterRequest(BaseModel):
+    full_name: str
+    email: str
+    password: str
+
+
+@app.post("/auth/register")
+def register():
+    db = get_db()
+    try:
+        payload = RegisterRequest.model_validate(request.get_json(force=True, silent=True) or {})
+    except ValidationError as e:
+        return api_error(e.errors()[0]["msg"], 422)
+
+    if not payload.full_name.strip():
+        return api_error("full_name cannot be empty", 400)
+    if len(payload.password) < 6:
+        return api_error("password must be at least 6 characters", 400)
+
+    existing = db.scalar(select(Customer).where(Customer.email == payload.email))
+    if existing:
+        return api_error("An account with this email already exists", 409)
+
+    customer = Customer(
+        full_name=payload.full_name.strip(),
+        email=payload.email,
+        hashed_password=hash_password(payload.password),
+    )
+    db.add(customer)
+    db.commit()
+
+    token = issue_token(customer.id, customer.email, "customer")
+    return (
+        jsonify(
+            {
+                "token": token,
+                "user": {"id": customer.id, "name": customer.full_name, "email": customer.email},
+            }
+        ),
+        201,
+    )
+
+
+@app.post("/auth/customer-login")
+def customer_login():
+    db = get_db()
+    try:
+        payload = LoginRequest.model_validate(request.get_json(force=True, silent=True) or {})
+    except ValidationError as e:
+        return api_error(e.errors()[0]["msg"], 422)
+
+    customer = db.scalar(select(Customer).where(Customer.email == payload.email))
+    if not customer or not customer.hashed_password:
+        return api_error("Invalid email or password", 401)
+    if not verify_password(payload.password, customer.hashed_password):
+        return api_error("Invalid email or password", 401)
+
+    token = issue_token(customer.id, customer.email, "customer")
+    return jsonify(
+        {
+            "token": token,
+            "user": {"id": customer.id, "name": customer.full_name, "email": customer.email},
+        }
+    )
+
+
+def _get_or_create_my_conversation(customer_id: int, db) -> Conversation:
+    """'1 user, 1 chat': always the customer's single ongoing conversation,
+    never a new session per message like the testing /chat endpoint allows."""
+    conversation = db.scalar(
+        select(Conversation)
+        .where(Conversation.customer_id == customer_id)
+        .order_by(Conversation.started_at)
+        .limit(1)
+    )
+    if conversation:
+        return conversation
+    conversation = Conversation(customer_id=customer_id)
+    db.add(conversation)
+    db.flush()
+    return conversation
+
+
+def _message_to_dict(m: Message) -> dict:
+    return {
+        "id": m.id,
+        "sender": m.sender_type.value,
+        "body": m.body,
+        "timestamp": m.sent_at.isoformat(),
+        "feedback": m.feedback.value if m.feedback else None,
+        "citations": m.citations or [],
+    }
+
+
+@app.get("/chat/me")
+@require_customer
+def my_chat_history():
+    db = get_db()
+    customer_id = int(g.current_customer["sub"])
+    conversation = _get_or_create_my_conversation(customer_id, db)
+    db.commit()
+
+    messages = db.scalars(
+        select(Message)
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.sent_at, Message.id)
+    ).all()
+
+    return jsonify(
+        {
+            "session_id": conversation.id,
+            "messages": [_message_to_dict(m) for m in messages],
+        }
+    )
+
+
+class MyChatRequest(BaseModel):
+    message: str
+
+
+@app.post("/chat/me")
+@require_customer
+def my_chat_send():
+    db = get_db()
+    customer_id = int(g.current_customer["sub"])
+
+    try:
+        payload = MyChatRequest.model_validate(request.get_json(force=True, silent=True) or {})
+    except ValidationError as e:
+        return api_error(e.errors()[0]["msg"], 422)
+    if not payload.message.strip():
+        return api_error("message cannot be empty", 400)
+
+    conversation = _get_or_create_my_conversation(customer_id, db)
+    assistant_message, citations = _run_chat_turn(conversation, payload.message, db)
+
+    return jsonify(
+        {
+            "session_id": conversation.id,
+            "reply": assistant_message.body,
+            "citations": citations,
+            "message_id": assistant_message.id,
+        }
+    )
+
+
+class FeedbackRequest(BaseModel):
+    feedback: str  # "good" | "bad"
+
+
+@app.post("/chat/messages/<int:message_id>/feedback")
+@require_customer
+def submit_feedback(message_id: int):
+    db = get_db()
+    customer_id = int(g.current_customer["sub"])
+
+    try:
+        payload = FeedbackRequest.model_validate(request.get_json(force=True, silent=True) or {})
+    except ValidationError as e:
+        return api_error(e.errors()[0]["msg"], 422)
+    if payload.feedback not in ("good", "bad"):
+        return api_error("feedback must be 'good' or 'bad'", 400)
+
+    message = db.get(Message, message_id)
+    if not message:
+        return api_error("Message not found", 404)
+    if message.sender_type != SenderType.agent:
+        return api_error("Feedback can only be given on AI replies", 400)
+
+    # ownership check: the message's conversation must belong to this customer
+    conversation = db.get(Conversation, message.conversation_id)
+    if not conversation or conversation.customer_id != customer_id:
+        return api_error("Message not found", 404)
+
+    message.feedback = FeedbackValue(payload.feedback)
+    db.commit()
+
+    return jsonify(_message_to_dict(message))
+
+
+ALLOWED_UPLOAD_EXTENSIONS = {"pdf", "docx", "txt", "md"}
+MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _process_document_in_background(document_id: int) -> None:
+    """Runs the full extract->chunk->embed->store pipeline on a separate
+    thread with its OWN database session - the request's session (via
+    flask.g) is torn down as soon as the request returns, so reusing it
+    here would fail. This is what actually fixes documents getting stuck
+    at 'processing' forever: previously this ran inside the request itself,
+    so a slow/large file could outlast gunicorn's request timeout, the
+    worker would be killed mid-request, and the status update to 'fail'
+    never got written because the process died before reaching it."""
+    from app.database import SessionLocal
+
+    thread_db = SessionLocal()
+    try:
+        process_document(document_id, thread_db)
+    finally:
+        thread_db.close()
+
+
+@app.post("/admin/documents/upload")
+@require_admin
+def upload_document():
+    db = get_db()
+
+    if "file" not in request.files:
+        return api_error("No file provided (expected multipart field 'file')", 400)
+
+    file = request.files["file"]
+    if not file.filename:
+        return api_error("Empty filename", 400)
+
+    try:
+        file_type = detect_file_type(file.filename)
+    except ValueError as e:
+        return api_error(str(e), 400)
+
+    # store under a random name on disk; original name kept in the DB
+    stored_name = f"{uuid.uuid4().hex}_{file.filename}"
+    stored_path = os.path.join(UPLOAD_DIR, stored_name)
+    file.save(stored_path)
+
+    size = os.path.getsize(stored_path)
+    if size > MAX_UPLOAD_SIZE_BYTES:
+        os.remove(stored_path)
+        return api_error(f"File exceeds {MAX_UPLOAD_SIZE_BYTES // (1024*1024)}MB limit", 400)
+
+    document = Document(
+        filename=file.filename,
+        stored_path=stored_path,
+        file_type=file_type,
+        uploaded_by_id=int(g.current_user["sub"]),
+        status=DocumentStatus.pending,
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    # Returns immediately - processing continues in the background so a
+    # large file can never time out the HTTP request. The frontend polls
+    # GET /admin/documents to see status move from pending -> processing
+    # -> success/fail.
+    thread = threading.Thread(
+        target=_process_document_in_background, args=(document.id,), daemon=True
+    )
+    thread.start()
+
+    return jsonify(_document_to_dict(document)), 202
+
+
+@app.get("/admin/documents")
+@require_admin
+def list_documents():
+    db = get_db()
+    documents = db.scalars(select(Document).order_by(Document.uploaded_at.desc())).all()
+    return jsonify({"documents": [_document_to_dict(d) for d in documents]})
+
+
+@app.post("/admin/documents/<int:document_id>/retry")
+@require_admin
+def retry_document(document_id: int):
+    db = get_db()
+    document = db.get(Document, document_id)
+    if not document:
+        return api_error("Document not found", 404)
+    if document.status == DocumentStatus.success:
+        return api_error("Document already processed successfully; nothing to retry", 400)
+
+    thread = threading.Thread(
+        target=_process_document_in_background, args=(document_id,), daemon=True
+    )
+    thread.start()
+
+    document.status = DocumentStatus.pending
+    db.commit()
+    db.refresh(document)
+    return jsonify(_document_to_dict(document)), 202
+
+
+@app.get("/admin/documents/<int:document_id>/chunks")
+@require_admin
+def get_document_chunks(document_id: int):
+    """Returns the actual stored chunk text for a document, so an admin
+    can see what the file was split into and what content will be
+    retrieved - not just a count."""
+    db = get_db()
+    document = db.get(Document, document_id)
+    if not document:
+        return api_error("Document not found", 404)
+
+    if document.status != DocumentStatus.success:
+        return jsonify(
+            {
+                "document_id": document_id,
+                "filename": document.filename,
+                "status": document.status.value,
+                "chunks": [],
+            }
+        )
+
+    collection = get_admin_collection()
+    result = collection.get(
+        where={"document_id": document_id},
+        include=["documents", "metadatas"],
+    )
+
+    # Chroma doesn't guarantee order - sort by the chunk_index we stored.
+    paired = sorted(
+        zip(result["metadatas"], result["documents"]),
+        key=lambda pair: pair[0]["chunk_index"],
+    )
+
+    return jsonify(
+        {
+            "document_id": document_id,
+            "filename": document.filename,
+            "status": document.status.value,
+            "chunks": [
+                {"chunk_index": meta["chunk_index"], "text": text} for meta, text in paired
+            ],
+        }
+    )
+
+
+def _document_to_dict(d: Document) -> dict:
+    return {
+        "id": d.id,
+        "filename": d.filename,
+        "file_type": d.file_type,
+        "status": d.status.value,
+        "uploaded_at": d.uploaded_at.isoformat(),
+        "processed_at": d.processed_at.isoformat() if d.processed_at else None,
+        "chunk_count": d.chunk_count,
+        "error_message": d.error_message,
+        "uploaded_by": d.uploaded_by.full_name if d.uploaded_by else None,
+    }
 
 
 @app.get("/stats")

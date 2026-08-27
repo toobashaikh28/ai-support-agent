@@ -56,17 +56,23 @@ def money(value) -> Decimal:
 # --------------------------------------------------------------------------
 
 def seed_users(db) -> list[User]:
+    from app.auth import hash_password
+
+    # Dev-only default credentials, printed at the end of seeding.
+    # Change this before deploying anywhere real.
+    admin_password = "admin123"
+
     users = [
         User(
             full_name="Admin User",
             email="admin@example.com",
-            hashed_password="!placeholder-replace-with-bcrypt",
+            hashed_password=hash_password(admin_password),
             role=UserRole.admin,
         ),
         User(
             full_name="Sara Supervisor",
             email="sara@example.com",
-            hashed_password="!placeholder-replace-with-bcrypt",
+            hashed_password=hash_password("supervisor123"),
             role=UserRole.supervisor,
         ),
     ]
@@ -75,7 +81,7 @@ def seed_users(db) -> list[User]:
             User(
                 full_name=fake.name(),
                 email=fake.unique.email(),
-                hashed_password="!placeholder-replace-with-bcrypt",
+                hashed_password=hash_password("agent123"),
                 role=UserRole.agent,
             )
         )
@@ -373,6 +379,8 @@ def run(reset: bool = False) -> None:
         db.commit()
         print(f"  orders:    {len(orders)}  (1 cancelled, 1 partially refunded, 1 unpaid)")
         print("Seed complete.")
+        print()
+        print("Admin login: admin@example.com / admin123")
     except Exception:
         db.rollback()
         raise

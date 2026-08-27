@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Log In</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="center-screen">
+    <div class="card auth-card">
+      <h1>Welcome back</h1>
+      <p class="subtitle">Log in to continue your chat.</p>
+
+      <form id="login-form">
+        <label for="email">Email</label>
+        <input type="email" id="email" required autocomplete="email">
+
+        <label for="password">Password</label>
+        <input type="password" id="password" required autocomplete="current-password">
+
+        <button type="submit" class="btn-primary" id="submit-btn">Log in</button>
+        <div class="error-text" id="error-text"></div>
+      </form>
+
+      <div class="switch-link">Don't have an account? <a href="register.html">Sign up</a></div>
+    </div>
+  </div>
+
+  <script src="login.js"></script>
+</body>
+</html>
