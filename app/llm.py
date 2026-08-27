@@ -39,6 +39,41 @@ SYSTEM_PROMPT = (
 )
 
 
+TRANSCRIBE_PROMPT = (
+    "Transcribe the following audio exactly, word for word, in the language "
+    "it was spoken in. Return ONLY the transcript text — no preamble, no "
+    "quotation marks, no commentary. If the audio is silent or unintelligible, "
+    "return an empty string."
+)
+
+
+def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
+    """
+    Sends raw audio bytes straight to Gemini (which is multimodal) and asks
+    for a plain transcript back. Kept in this module, next to call_llm, so
+    both LLM-touching operations live in one place and are both easy to
+    monkeypatch in tests.
+
+    mime_type should match what the browser recorded, e.g. "audio/webm" or
+    "audio/wav" - Gemini accepts common audio containers directly.
+    """
+    client = get_client()
+
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                    types.Part(text=TRANSCRIBE_PROMPT),
+                ],
+            )
+        ],
+    )
+    return (response.text or "").strip()
+
+
 def call_llm(history: list[dict[str, str]], system_prompt: str | None = None) -> str:
     """
     history: list of {"role": "user"|"assistant", "content": str}, oldest first.

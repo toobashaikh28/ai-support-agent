@@ -221,3 +221,56 @@ button {
   font-size: 13px;
   margin-top: 60px;
 }
+
+/* --- voice --- */
+
+#mic-btn {
+  background: var(--bubble-agent);
+  color: var(--text);
+  padding: 10px 14px;
+  font-size: 16px;
+  line-height: 1;
+}
+#mic-btn:hover { background: #e4e7eb; }
+#mic-btn.recording {
+  background: var(--bad);
+  color: white;
+  animation: mic-pulse 1.1s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(192, 57, 43, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(192, 57, 43, 0); }
+}
+
+.voice-status {
+  max-width: 760px;
+  margin: 6px auto 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  min-height: 16px;
+  text-align: center;
+}
+
+.speaker-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 13px;
+  opacity: 0.45;
+  transition: opacity 0.15s;
+}
+.speaker-btn:hover { opacity: 0.9; }
+.speaker-btn.speaking { opacity: 1; color: var(--primary); }
+
+.escalation-banner {
+  max-width: 760px;
+  margin: 0 auto 10px;
+  background: #fff4e5;
+  border: 1px solid #f0c896;
+  color: #7a4a12;
+  font-size: 13px;
+  padding: 10px 14px;
+  border-radius: 8px;
+}
+.escalation-banner b { color: #5c3800; }

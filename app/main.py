@@ -1,4 +1,5 @@
 import os
+import secrets
 import threading
 import uuid
 
@@ -9,8 +10,15 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import hash_password, issue_token, require_admin, require_customer, verify_password
 from app.database import Base, SessionLocal, engine
-from app.llm import call_llm
+from app.llm import call_llm, transcribe_audio
 from app.rag.chat_grounding import generate_grounded_reply
+from app.rag.escalation import (
+    PRIORITY_BY_REASON,
+    REASON_LABELS,
+    generate_escalation_summary,
+    should_escalate,
+)
+from app.rag.sentiment import classify_message
 from app.models import (
     Conversation,
     Customer,
@@ -24,6 +32,8 @@ from app.models import (
     Product,
     SenderType,
     Ticket,
+    TicketPriority,
+    TicketStatus,
     User,
 )
 from app.rag.document_pipeline import process_document
@@ -99,16 +109,120 @@ class ChatRequest(BaseModel):
     customer_id: int | None = None
 
 
-def _run_chat_turn(conversation: "Conversation", user_message: str, db) -> tuple["Message", list]:
-    """Stores the user's message, runs grounded generation with recent
-    context, stores the assistant's reply, and returns the assistant's
-    Message row (so callers can return its id, e.g. for feedback) plus
-    citations. Shared by /chat and /chat/me so both stay in sync."""
+def _existing_open_ticket(conversation_id: int, db) -> "Ticket | None":
+    """A conversation should only ever have one active escalation ticket -
+    if the customer's second frustrated message arrives before a human has
+    picked up the first ticket, we don't want a fresh duplicate every turn."""
+    return db.scalar(
+        select(Ticket)
+        .where(Ticket.conversation_id == conversation_id)
+        .where(Ticket.status.in_([TicketStatus.open, TicketStatus.in_progress, TicketStatus.escalated]))
+        .order_by(Ticket.created_at.desc())
+        .limit(1)
+    )
+
+
+def _build_transcript(recent_messages: list["Message"], latest_user_message: str, latest_reply: str) -> str:
+    lines = []
+    for m in recent_messages:
+        speaker = "Customer" if m.sender_type == SenderType.customer else "Agent"
+        lines.append(f"{speaker}: {m.body}")
+    lines.append(f"Customer: {latest_user_message}")
+    lines.append(f"Agent: {latest_reply}")
+    return "\n".join(lines)
+
+
+def _maybe_escalate(
+    conversation: "Conversation",
+    user_message: str,
+    reply_text: str,
+    sentiment: str,
+    complaint_type: str,
+    recent_messages: list["Message"],
+    db,
+) -> dict | None:
+    """Runs the escalation rules and, if warranted and not already done for
+    this conversation, writes a Ticket with an auto-generated handoff
+    summary. Returns None when no escalation happened, otherwise a small
+    dict the API responses can surface to the frontend."""
+    escalate, reason = should_escalate(user_message, sentiment, complaint_type)
+    if not escalate:
+        return None
+
+    existing = _existing_open_ticket(conversation.id, db)
+    if existing:
+        return {
+            "ticket_reference": existing.reference,
+            "priority": existing.priority.value,
+            "already_escalated": True,
+        }
+
+    customer = conversation.customer  # lazy-loads within this session
+    transcript = _build_transcript(recent_messages, user_message, reply_text)
+
+    try:
+        summary = generate_escalation_summary(
+            customer_name=customer.full_name,
+            customer_email=customer.email,
+            sentiment=sentiment,
+            transcript=transcript,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed summary must not block escalation
+        print(f"[escalation] summary generation failed, using a fallback note: {exc}")
+        summary = (
+            f"Customer: {customer.full_name} ({customer.email})\n"
+            f"Issue: (auto-summary unavailable) {user_message}\n"
+            f"Sentiment: {sentiment}\n"
+            f"What the AI already told the customer: {reply_text}\n"
+            f"Recommended next step: Review the conversation and follow up directly."
+        )
+
+    priority_value = PRIORITY_BY_REASON.get(reason, "normal")
+    subject = (
+        REASON_LABELS.get(reason, "Escalated conversation")
+        + (f" — {complaint_type.replace('_', ' ')}" if complaint_type != "general_question" else "")
+    )
+
+    ticket = Ticket(
+        reference=f"TKT-{secrets.token_hex(3).upper()}",
+        customer_id=customer.id,
+        conversation_id=conversation.id,
+        subject=subject[:200],
+        description=summary,
+        category=complaint_type,
+        priority=TicketPriority(priority_value),
+        status=TicketStatus.escalated,
+    )
+    db.add(ticket)
+    db.commit()
+    db.refresh(ticket)
+
+    return {
+        "ticket_reference": ticket.reference,
+        "priority": ticket.priority.value,
+        "already_escalated": False,
+    }
+
+
+def _run_chat_turn(conversation: "Conversation", user_message: str, db) -> tuple["Message", list, dict | None]:
+    """Stores the user's message (tagged with sentiment + complaint type),
+    runs grounded generation with recent context - in an empathetic,
+    solution-first tone when the message describes a real problem - stores
+    the assistant's reply, and escalates to a human when the escalation
+    rules say so. Returns the assistant's Message row, its citations, and
+    escalation info (None if nothing was escalated). Shared by /chat,
+    /chat/me and /chat/me/voice so all three stay in sync."""
+    classification = classify_message(user_message)
+    sentiment = classification["sentiment"]
+    complaint_type = classification["complaint_type"]
+
     db.add(
         Message(
             conversation_id=conversation.id,
             sender_type=SenderType.customer,
             body=user_message,
+            sentiment=sentiment,
+            complaint_type=complaint_type,
         )
     )
     db.flush()
@@ -129,7 +243,9 @@ def _run_chat_turn(conversation: "Conversation", user_message: str, db) -> tuple
         for m in recent
     ]
 
-    reply_text, citations = generate_grounded_reply(llm_history, user_message)
+    reply_text, citations = generate_grounded_reply(
+        llm_history, user_message, complaint_type=complaint_type
+    )
 
     assistant_message = Message(
         conversation_id=conversation.id,
@@ -142,7 +258,11 @@ def _run_chat_turn(conversation: "Conversation", user_message: str, db) -> tuple
     db.commit()
     db.refresh(assistant_message)
 
-    return assistant_message, citations
+    escalation_info = _maybe_escalate(
+        conversation, user_message, reply_text, sentiment, complaint_type, recent, db
+    )
+
+    return assistant_message, citations, escalation_info
 
 
 @app.post("/chat")
@@ -172,7 +292,7 @@ def chat():
         db.add(conversation)
         db.flush()  # assigns conversation.id without committing yet
 
-    assistant_message, citations = _run_chat_turn(conversation, payload.message, db)
+    assistant_message, citations, escalation = _run_chat_turn(conversation, payload.message, db)
 
     return jsonify(
         {
@@ -180,6 +300,7 @@ def chat():
             "reply": assistant_message.body,
             "citations": citations,
             "message_id": assistant_message.id,
+            "escalation": escalation,
         }
     )
 
@@ -417,6 +538,8 @@ def _message_to_dict(m: Message) -> dict:
         "timestamp": m.sent_at.isoformat(),
         "feedback": m.feedback.value if m.feedback else None,
         "citations": m.citations or [],
+        "sentiment": m.sentiment,
+        "complaint_type": m.complaint_type,
     }
 
 
@@ -434,10 +557,13 @@ def my_chat_history():
         .order_by(Message.sent_at, Message.id)
     ).all()
 
+    open_ticket = _existing_open_ticket(conversation.id, db)
+
     return jsonify(
         {
             "session_id": conversation.id,
             "messages": [_message_to_dict(m) for m in messages],
+            "open_ticket_reference": open_ticket.reference if open_ticket else None,
         }
     )
 
@@ -460,7 +586,7 @@ def my_chat_send():
         return api_error("message cannot be empty", 400)
 
     conversation = _get_or_create_my_conversation(customer_id, db)
-    assistant_message, citations = _run_chat_turn(conversation, payload.message, db)
+    assistant_message, citations, escalation = _run_chat_turn(conversation, payload.message, db)
 
     return jsonify(
         {
@@ -468,6 +594,75 @@ def my_chat_send():
             "reply": assistant_message.body,
             "citations": citations,
             "message_id": assistant_message.id,
+            "escalation": escalation,
+        }
+    )
+
+
+ALLOWED_AUDIO_EXTENSIONS = {"webm", "wav", "mp3", "m4a", "ogg"}
+AUDIO_MIME_BY_EXT = {
+    "webm": "audio/webm",
+    "wav": "audio/wav",
+    "mp3": "audio/mp3",
+    "m4a": "audio/mp4",
+    "ogg": "audio/ogg",
+}
+MAX_AUDIO_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB - a few minutes of speech
+
+
+@app.post("/chat/me/voice")
+@require_customer
+def my_chat_send_voice():
+    """
+    Voice-input counterpart to /chat/me. Accepts a recorded audio clip
+    (multipart field 'audio'), transcribes it with Gemini, then runs the
+    transcript through the exact same _run_chat_turn() the text endpoint
+    uses - so grounding, citations, and history all behave identically
+    regardless of which "door" the message came in through.
+
+    Text-to-speech for the reply is done client-side (Web Speech API) so
+    this endpoint only ever returns text - see chat.js.
+    """
+    db = get_db()
+    customer_id = int(g.current_customer["sub"])
+
+    if "audio" not in request.files:
+        return api_error("No audio provided (expected multipart field 'audio')", 400)
+
+    audio_file = request.files["audio"]
+    if not audio_file.filename:
+        return api_error("Empty audio filename", 400)
+
+    ext = audio_file.filename.rsplit(".", 1)[-1].lower() if "." in audio_file.filename else ""
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        return api_error(
+            f"Unsupported audio format '{ext}'. Allowed: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}",
+            400,
+        )
+
+    audio_bytes = audio_file.read()
+    if len(audio_bytes) > MAX_AUDIO_SIZE_BYTES:
+        return api_error(f"Audio exceeds {MAX_AUDIO_SIZE_BYTES // (1024*1024)}MB limit", 400)
+    if not audio_bytes:
+        return api_error("Empty audio file", 400)
+
+    transcript = transcribe_audio(audio_bytes, AUDIO_MIME_BY_EXT[ext])
+    if not transcript:
+        return api_error(
+            "Couldn't hear anything in that recording — please try again.", 400
+        )
+
+    conversation = _get_or_create_my_conversation(customer_id, db)
+    assistant_message, citations, escalation = _run_chat_turn(conversation, transcript, db)
+
+    return jsonify(
+        {
+            "session_id": conversation.id,
+            "transcript": transcript,
+            "reply": assistant_message.body,
+            "citations": citations,
+            "message_id": assistant_message.id,
+            "escalation": escalation,
         }
     )
 

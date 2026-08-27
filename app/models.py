@@ -326,6 +326,14 @@ class Message(Base):
     # this reply. Persisted (not just returned on the POST response) so
     # citations still show correctly when history is reloaded later.
     citations: Mapped[list | None] = mapped_column(JSONType)
+    # Only set on sender_type=customer messages: sentiment and complaint
+    # classification, run once right after the message is stored. Used to
+    # both steer the reply's tone (app/rag/chat_grounding.py) and decide
+    # on escalation (app/rag/escalation.py). Plain strings rather than a
+    # native Postgres enum, same choice as Document.file_type - avoids an
+    # enum-type migration if the label set grows later.
+    sentiment: Mapped[str | None] = mapped_column(String(20), index=True)
+    complaint_type: Mapped[str | None] = mapped_column(String(40), index=True)
     # Only meaningful on sender_type=agent messages. NULL until the user
     # rates the reply; "good"/"bad" thereafter.
     feedback: Mapped[FeedbackValue | None] = mapped_column(Enum(FeedbackValue, name="feedback_value"))
@@ -349,6 +357,10 @@ class Ticket(Base):
     order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id", ondelete="SET NULL"), index=True)
     assigned_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
     subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    # The auto-generated handoff note a human agent reads when picking up
+    # the ticket: what happened, sentiment, what the AI already said,
+    # recommended next step. See app/rag/escalation.py.
+    description: Mapped[str | None] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(String(80), index=True)
     priority: Mapped[TicketPriority] = mapped_column(
         Enum(TicketPriority, name="ticket_priority"), default=TicketPriority.normal, nullable=False
