@@ -3,14 +3,14 @@ import secrets
 import threading
 import uuid
 
-from flask import Flask, g, jsonify, request, send_from_directory
+from flask import Flask, Response, g, jsonify, request, send_from_directory
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.auth import hash_password, issue_token, require_admin, require_customer, verify_password
 from app.database import Base, SessionLocal, engine
-from app.llm import call_llm, transcribe_audio
+from app.llm import call_llm, synthesize_speech, transcribe_audio
 from app.rag.chat_grounding import generate_grounded_reply
 from app.rag.escalation import (
     PRIORITY_BY_REASON,
@@ -665,6 +665,44 @@ def my_chat_send_voice():
             "escalation": escalation,
         }
     )
+
+
+MAX_TTS_CHARS = 2000  # a generous cap - long enough for any real reply,
+                       # short enough to keep one synthesis call cheap and fast
+
+
+class SpeakRequest(BaseModel):
+    text: str
+
+
+@app.post("/chat/me/speak")
+@require_customer
+def speak_reply():
+    """
+    Text-to-speech counterpart to /chat/me/voice: takes any text (normally
+    an agent reply already shown in the chat) and returns natural-sounding
+    speech as a WAV file. Deliberately generic rather than tied to a
+    message id - the same endpoint powers both the "replay this reply" 🔊
+    button and the live call's spoken responses.
+    """
+    try:
+        payload = SpeakRequest.model_validate(request.get_json(force=True, silent=True) or {})
+    except ValidationError as e:
+        return api_error(e.errors()[0]["msg"], 422)
+
+    text = payload.text.strip()
+    if not text:
+        return api_error("text cannot be empty", 400)
+    if len(text) > MAX_TTS_CHARS:
+        return api_error(f"text exceeds {MAX_TTS_CHARS} characters", 400)
+
+    try:
+        wav_bytes = synthesize_speech(text)
+    except Exception as exc:  # noqa: BLE001 - surface as a clean 502, not a stack trace
+        print(f"[tts] synthesis failed: {exc}")
+        return api_error("Voice synthesis is temporarily unavailable.", 502)
+
+    return Response(wav_bytes, mimetype="audio/wav")
 
 
 class FeedbackRequest(BaseModel):

@@ -11,6 +11,7 @@
       <h1>Support Chat</h1>
       <div>
         <span class="user-info" id="user-info"></span>
+        <button type="button" id="call-btn" class="call-btn" title="Call support">📞 Call</button>
         <span class="logout-link" id="logout-link">Log out</span>
       </div>
     </div>
@@ -26,6 +27,23 @@
         <button type="submit" id="send-btn">Send</button>
       </form>
       <div class="voice-status" id="voice-status"></div>
+    </div>
+  </div>
+
+  <div class="call-overlay" id="call-overlay">
+    <div class="call-card">
+      <button type="button" class="call-close" id="call-close" title="End call">✕</button>
+
+      <div class="call-orb" id="call-orb">
+        <span class="call-orb-icon" id="call-orb-icon">📞</span>
+      </div>
+
+      <div class="call-state" id="call-state">Connecting...</div>
+      <div class="call-hint" id="call-hint">Speak naturally — the agent will respond out loud.</div>
+
+      <div class="call-transcript" id="call-transcript"></div>
+
+      <button type="button" class="call-end-btn" id="call-end-btn">End Call</button>
     </div>
   </div>
 

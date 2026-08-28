@@ -7,12 +7,24 @@ rest of the app never touches the genai client directly. That means:
   - tests can monkeypatch call_llm() instead of mocking a network call
 """
 
+import io
 import os
+import wave
 
 from google import genai
 from google.genai import types
 
 MODEL = "gemini-3.6-flash"
+
+# Gemini's dedicated speech-generation model - a genuinely natural, expressive
+# voice, not the robotic default that ships with browsers. Kept as a separate
+# constant from MODEL since it's a different model family (audio-out only,
+# text-in only) with its own preview limitations.
+TTS_MODEL = "gemini-3.1-flash-tts-preview"
+# One of Gemini's 30 prebuilt voices - warm and neutral, a reasonable
+# default for a support agent. Swap this to try others; the full gallery
+# is browsable live in Google AI Studio's Voice Library before committing.
+TTS_VOICE = "Kore"
 
 _client: genai.Client | None = None
 
@@ -99,3 +111,51 @@ def call_llm(history: list[dict[str, str]], system_prompt: str | None = None) ->
         config=types.GenerateContentConfig(system_instruction=system_prompt or SYSTEM_PROMPT),
     )
     return response.text
+
+
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
+    """
+    Gemini's TTS model returns raw 16-bit mono PCM, not a playable audio
+    file - there's no header describing sample rate/channels/bit depth, so
+    a browser <audio> element can't play it as-is. Wrapping it in a
+    standard WAV header (via the stdlib wave module, no ffmpeg needed)
+    turns it into a normal .wav file any browser can play directly.
+    """
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)       # mono
+        wav_file.setsampwidth(2)       # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+    return buffer.getvalue()
+
+
+def synthesize_speech(text: str, voice: str = TTS_VOICE) -> bytes:
+    """
+    Turns reply text into natural-sounding speech and returns playable WAV
+    bytes. Used wherever the app previously relied on the browser's
+    built-in (robotic) speechSynthesis - the live call and the "replay
+    this reply" button.
+
+    Kept as a single call per full reply rather than streamed - simpler,
+    and reply lengths in this app are short enough that the latency is
+    acceptable. If replies grow much longer, this is the first place to
+    revisit (split into sentence-level chunks and stream them).
+    """
+    client = get_client()
+
+    response = client.models.generate_content(
+        model=TTS_MODEL,
+        contents=[types.Content(role="user", parts=[types.Part(text=text)])],
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                )
+            ),
+        ),
+    )
+
+    pcm_bytes = response.candidates[0].content.parts[0].inline_data.data
+    return _pcm_to_wav(pcm_bytes)

@@ -359,21 +359,305 @@ async function sendVoiceMessage(blob, mimeType) {
   }
 }
 
-function speakText(text, triggerBtn = null) {
-  if (!window.speechSynthesis) {
-    alert("Voice output isn't supported in this browser. Try Chrome or Edge.");
-    return;
-  }
-  window.speechSynthesis.cancel(); // stop anything already playing first
+// Tracks the currently playing natural-voice clip so a new speakText()
+// call can stop it first, the same role speechSynthesis.cancel() used to
+// play for the old browser-voice version.
+let currentSpeechAudio = null;
 
+function speakWithBrowserFallback(text, triggerBtn) {
+  // Used only if the natural-voice API call fails (network issue, quota,
+  // etc.) - keeps voice output working end-to-end rather than going
+  // silent, just in the old robotic voice for that one reply.
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.rate = 1.0;
-
   if (triggerBtn) {
     triggerBtn.classList.add("speaking");
     utterance.addEventListener("end", () => triggerBtn.classList.remove("speaking"));
     utterance.addEventListener("error", () => triggerBtn.classList.remove("speaking"));
   }
-
   window.speechSynthesis.speak(utterance);
 }
+
+async function speakText(text, triggerBtn = null) {
+  if (currentSpeechAudio) {
+    currentSpeechAudio.pause();
+    currentSpeechAudio = null;
+  }
+  window.speechSynthesis?.cancel(); // in case a fallback clip is mid-playback
+
+  if (triggerBtn) triggerBtn.classList.add("speaking");
+
+  try {
+    const res = await apiFetch("/chat/me/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) throw new Error("TTS request failed");
+
+    const blob = await res.blob();
+    const audio = new Audio(URL.createObjectURL(blob));
+    currentSpeechAudio = audio;
+
+    audio.addEventListener("ended", () => {
+      if (triggerBtn) triggerBtn.classList.remove("speaking");
+      currentSpeechAudio = null;
+    });
+    audio.addEventListener("error", () => {
+      if (triggerBtn) triggerBtn.classList.remove("speaking");
+      currentSpeechAudio = null;
+    });
+
+    await audio.play();
+  } catch (err) {
+    console.warn("Natural voice unavailable, falling back to browser voice:", err);
+    speakWithBrowserFallback(text, triggerBtn);
+  }
+}
+
+// --------------------------------------------------------------------------
+// Live call: a "Call" button that opens a full-screen overlay with a
+// continuous listen -> think -> speak -> listen loop, so the customer
+// talks the way they would on an actual phone call instead of recording
+// and sending one clip at a time (that's the mic button on the composer).
+//
+// This uses the browser's built-in SpeechRecognition for STT - it's
+// streaming and near-instant, which matters for something that's supposed
+// to feel live. Recognition is paused while the AI is thinking/speaking so
+// it doesn't pick up the AI's own voice as new input, then resumes
+// automatically. Every turn goes through the exact same /chat/me endpoint
+// as typed messages, so grounding, tone-switching, and escalation all work
+// identically on a call.
+// --------------------------------------------------------------------------
+
+const callBtn = document.getElementById("call-btn");
+const callOverlay = document.getElementById("call-overlay");
+const callClose = document.getElementById("call-close");
+const callEndBtn = document.getElementById("call-end-btn");
+const callOrb = document.getElementById("call-orb");
+const callOrbIcon = document.getElementById("call-orb-icon");
+const callStateEl = document.getElementById("call-state");
+const callHint = document.getElementById("call-hint");
+const callTranscript = document.getElementById("call-transcript");
+
+const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+let recognition = null;
+let callActive = false;
+let stoppedForProcessing = false; // true when *we* stopped recognition to handle a turn,
+                                   // vs. the browser auto-stopping after silence
+
+function setCallState(state) {
+  callOrb.classList.remove("listening", "thinking", "speaking");
+  if (state === "listening") {
+    callOrb.classList.add("listening");
+    callOrbIcon.textContent = "🎤";
+    callStateEl.textContent = "Listening...";
+    callHint.textContent = "Speak naturally — the agent will respond out loud.";
+  } else if (state === "thinking") {
+    callOrb.classList.add("thinking");
+    callOrbIcon.textContent = "💭";
+    callStateEl.textContent = "Thinking...";
+    callHint.textContent = "";
+  } else if (state === "speaking") {
+    callOrb.classList.add("speaking");
+    callOrbIcon.textContent = "🔊";
+    callStateEl.textContent = "Speaking...";
+    callHint.textContent = "";
+  } else {
+    callOrbIcon.textContent = "📞";
+    callStateEl.textContent = "Connecting...";
+    callHint.textContent = "";
+  }
+}
+
+function addCallLine(speaker, text, interim = false) {
+  const existingInterim = callTranscript.querySelector(".call-line.interim");
+  if (existingInterim) existingInterim.remove();
+
+  const line = document.createElement("div");
+  line.className = "call-line" + (interim ? " interim" : "");
+  line.innerHTML = `<b>${speaker}:</b> ${text}`;
+  callTranscript.appendChild(line);
+  callTranscript.scrollTop = callTranscript.scrollHeight;
+}
+
+function initRecognition() {
+  recognition = new SpeechRecognitionAPI();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = "en-US";
+
+  recognition.addEventListener("result", (event) => {
+    let interimText = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (result.isFinal) {
+        const finalText = result[0].transcript.trim();
+        if (finalText) {
+          addCallLine("You", finalText);
+          stoppedForProcessing = true;
+          recognition.stop();
+          handleCallTurn(finalText);
+        }
+        return;
+      }
+      interimText += result[0].transcript;
+    }
+    if (interimText.trim()) {
+      addCallLine("You", interimText, true);
+    }
+  });
+
+  recognition.addEventListener("end", () => {
+    // The browser stops recognition on its own after a stretch of silence.
+    // If the call is still active and we didn't stop it ourselves to
+    // process a turn, just restart listening - that's what makes it feel
+    // continuous rather than push-to-talk.
+    if (callActive && !stoppedForProcessing) {
+      try {
+        recognition.start();
+      } catch (err) {
+        // already running - ignore
+      }
+    }
+    stoppedForProcessing = false;
+  });
+
+  recognition.addEventListener("error", (event) => {
+    if (event.error === "no-speech" || event.error === "aborted") {
+      return; // expected during normal pauses, onend will restart it
+    }
+    if (event.error === "not-allowed" || event.error === "audio-capture") {
+      addCallLine("System", "Microphone access is blocked - please allow mic access and try again.");
+      endCall();
+    }
+  });
+}
+
+async function handleCallTurn(userText) {
+  setCallState("thinking");
+
+  try {
+    const res = await apiFetch("/chat/me", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: userText }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      addCallLine("System", data.detail || "Something went wrong.");
+      if (callActive) resumeListening();
+      return;
+    }
+
+    addCallLine("Agent", data.reply);
+    if (data.escalation) showEscalationBanner(data.escalation);
+
+    setCallState("speaking");
+    speakOnCall(data.reply);
+  } catch (err) {
+    addCallLine("System", "Could not reach the server.");
+    if (callActive) resumeListening();
+  }
+}
+
+async function speakOnCall(text) {
+  if (currentSpeechAudio) {
+    currentSpeechAudio.pause();
+    currentSpeechAudio = null;
+  }
+  window.speechSynthesis?.cancel();
+
+  try {
+    const res = await apiFetch("/chat/me/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) throw new Error("TTS request failed");
+
+    const blob = await res.blob();
+    const audio = new Audio(URL.createObjectURL(blob));
+    currentSpeechAudio = audio;
+
+    audio.addEventListener("ended", () => {
+      currentSpeechAudio = null;
+      if (callActive) resumeListening();
+    });
+    audio.addEventListener("error", () => {
+      currentSpeechAudio = null;
+      if (callActive) resumeListening();
+    });
+
+    await audio.play();
+  } catch (err) {
+    console.warn("Natural voice unavailable on call, falling back to browser voice:", err);
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.addEventListener("end", () => { if (callActive) resumeListening(); });
+    utterance.addEventListener("error", () => { if (callActive) resumeListening(); });
+    window.speechSynthesis.speak(utterance);
+  }
+}
+
+function resumeListening() {
+  setCallState("listening");
+  try {
+    recognition.start();
+  } catch (err) {
+    // already running - ignore
+  }
+}
+
+function startCall() {
+  if (!SpeechRecognitionAPI) {
+    alert("Live calling needs Chrome or Edge — this browser doesn't support real-time speech recognition.");
+    return;
+  }
+  if (!window.speechSynthesis) {
+    alert("Voice output isn't supported in this browser. Try Chrome or Edge.");
+    return;
+  }
+
+  callTranscript.innerHTML = "";
+  callOverlay.classList.add("active");
+  setCallState(null);
+  callActive = true;
+
+  initRecognition();
+
+  navigator.mediaDevices
+    .getUserMedia({ audio: true })
+    .then(() => {
+      resumeListening();
+      addCallLine("System", "Call connected.");
+    })
+    .catch(() => {
+      addCallLine("System", "Microphone permission was denied.");
+      endCall();
+    });
+}
+
+function endCall() {
+  callActive = false;
+  window.speechSynthesis.cancel();
+  if (currentSpeechAudio) {
+    currentSpeechAudio.pause();
+    currentSpeechAudio = null;
+  }
+  if (recognition) {
+    stoppedForProcessing = true; // prevent the onend auto-restart
+    recognition.stop();
+    recognition = null;
+  }
+  callOverlay.classList.remove("active");
+  loadHistory(); // pull the call's messages into the regular chat view
+}
+
+callBtn.addEventListener("click", startCall);
+callClose.addEventListener("click", endCall);
+callEndBtn.addEventListener("click", endCall);

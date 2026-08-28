@@ -274,3 +274,126 @@ button {
   border-radius: 8px;
 }
 .escalation-banner b { color: #5c3800; }
+
+/* --- live call --- */
+
+.call-btn {
+  background: var(--good);
+  color: white;
+  border: none;
+  border-radius: 999px;
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-right: 14px;
+}
+.call-btn:hover { background: #146c43; }
+
+.call-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 20, 30, 0.94);
+  z-index: 1000;
+  align-items: center;
+  justify-content: center;
+}
+.call-overlay.active { display: flex; }
+
+.call-card {
+  width: 100%;
+  max-width: 420px;
+  text-align: center;
+  padding: 32px 24px;
+  position: relative;
+}
+
+.call-close {
+  position: absolute;
+  top: -8px;
+  right: 4px;
+  background: none;
+  border: none;
+  color: #9aa4b2;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 6px;
+}
+.call-close:hover { color: white; }
+
+.call-orb {
+  width: 120px;
+  height: 120px;
+  margin: 0 auto 22px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #3a4a63, #1c2634);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 42px;
+  transition: box-shadow 0.3s ease;
+  box-shadow: 0 0 0 0 rgba(47, 158, 68, 0);
+}
+.call-orb.listening {
+  box-shadow: 0 0 0 14px rgba(47, 158, 68, 0.15);
+  animation: orb-pulse-green 1.6s ease-in-out infinite;
+}
+.call-orb.thinking {
+  animation: orb-spin 1.1s linear infinite;
+}
+.call-orb.speaking {
+  box-shadow: 0 0 0 14px rgba(47, 111, 235, 0.18);
+  animation: orb-pulse-blue 1s ease-in-out infinite;
+}
+@keyframes orb-pulse-green {
+  0%, 100% { box-shadow: 0 0 0 8px rgba(47, 158, 68, 0.12); }
+  50% { box-shadow: 0 0 0 20px rgba(47, 158, 68, 0.02); }
+}
+@keyframes orb-pulse-blue {
+  0%, 100% { box-shadow: 0 0 0 8px rgba(47, 111, 235, 0.16); }
+  50% { box-shadow: 0 0 0 20px rgba(47, 111, 235, 0.03); }
+}
+@keyframes orb-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.call-state {
+  color: white;
+  font-size: 17px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.call-hint {
+  color: #9aa4b2;
+  font-size: 13px;
+  margin-bottom: 22px;
+}
+
+.call-transcript {
+  max-height: 220px;
+  overflow-y: auto;
+  text-align: left;
+  background: rgba(255,255,255,0.04);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 22px;
+  font-size: 13px;
+  color: #cbd3dd;
+}
+.call-transcript .call-line { margin-bottom: 8px; line-height: 1.4; }
+.call-transcript .call-line b { color: white; }
+.call-transcript .call-line.interim { opacity: 0.5; font-style: italic; }
+
+.call-end-btn {
+  background: var(--bad);
+  color: white;
+  border: none;
+  border-radius: 999px;
+  padding: 12px 32px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.call-end-btn:hover { background: #a53225; }
